@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+from agents.auth_agent import run_auth_agent
 
 BASE_DIR = Path(__file__).parent.parent
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "migrated"
@@ -19,6 +20,8 @@ def generate_report():
         "recommendations": [],
         "dependency_map": {},
         "manual_fixes": [],
+        "readiness": {"score": 0, "level": "Unknown", "summary": "", "categories": [], "recommendations": []},
+        "auth_migration": {},
         "validation": {"success": False, "stage": "not run", "output": "", "errors": ""},
         "diff": {"summary": {"added": 0, "modified": 0, "removed": 0, "unchanged": 0}, "added": [], "modified": [], "removed": [], "previews": []},
         "code_rewrite_previews": [],
@@ -63,14 +66,17 @@ def generate_report():
 
     # --- manual_fixes ---
     manual_fixes = []
+    # Scan migrated output for remaining code issues
     for cs_file in migrated_dir.rglob("*.cs"):
+        if any(p.lower() in {"obj", "bin"} for p in cs_file.parts):
+            continue
         try:
             content = cs_file.read_text(encoding="utf-8", errors="ignore")
             rel = str(cs_file.relative_to(migrated_dir))
             if "TODO" in content or "FIXME" in content:
                 manual_fixes.append(f"{rel}: Contains TODO/FIXME comments requiring attention")
             if "System.Web" in content:
-                manual_fixes.append(f"{rel}: Contains System.Web references — verify compatibility")
+                manual_fixes.append(f"{rel}: Still contains System.Web references — verify compatibility")
             if re.search(r"async void \w+\(", content):
                 manual_fixes.append(f"{rel}: Contains async void methods — consider async Task instead")
             if "HttpContext.Current" in content:
@@ -79,6 +85,22 @@ def generate_report():
                 manual_fixes.append(f"{rel}: Contains ConfigurationManager — replace with IConfiguration")
         except Exception:
             pass
+    # Scan for structural leftovers that should have been removed
+    structural_leftovers = [
+        ("packages.config",  "packages.config still present — migrate to PackageReference in .csproj"),
+        ("Web.config",       "Web.config still present — review IIS/system.web settings, not needed in ASP.NET Core"),
+        ("Global.asax",      "Global.asax still present — startup hooks should be in Program.cs"),
+        ("Global.asax.cs",   "Global.asax.cs still present — merge application startup logic into Program.cs"),
+        ("App_Start",        "App_Start folder still present — BundleConfig/RouteConfig/FilterConfig not needed in ASP.NET Core"),
+        ("AssemblyInfo.cs",  "AssemblyInfo.cs still present — not needed in SDK-style projects"),
+    ]
+    for filename, message in structural_leftovers:
+        matches = list(migrated_dir.rglob(filename))
+        for match in matches:
+            if any(p.lower() in {"obj", "bin"} for p in match.parts):
+                continue
+            rel = str(match.relative_to(migrated_dir))
+            manual_fixes.append(f"{rel}: {message}")
 
     # --- diff (compare upload vs migrated) ---
     diff = _build_diff(upload_dir, migrated_dir)
@@ -86,8 +108,19 @@ def generate_report():
     # --- code_rewrite_previews ---
     code_rewrite_previews = _build_rewrite_previews(upload_dir, migrated_dir)
 
-    # --- validation (check if dotnet is available and run build) ---
-    validation = _run_validation(migrated_dir)
+    # --- validation (use build_validator result if available, else run fresh) ---
+    from agents.build_validator import run_build_validator
+    validation_raw = run_build_validator(str(migrated_dir))
+    validation = {
+        "success":  validation_raw.get("success", False),
+        "stage":    "build",
+        "output":   validation_raw.get("output", ""),
+        "errors":   validation_raw.get("output", "") if not validation_raw.get("success") else "",
+        "skipped":  validation_raw.get("skipped", False),
+        "reason":   validation_raw.get("reason", ""),
+        "auto_fixes": validation_raw.get("auto_fixes", []) + validation_raw.get("pre_clean_fixes", []),
+        "error_list": validation_raw.get("errors", []),
+    }
 
     # --- build_fixer ---
     build_fixer = _build_fixer(validation)
@@ -101,6 +134,76 @@ def generate_report():
     # --- generated_tests ---
     generated_tests = _generated_tests(migrated_dir)
 
+    # --- auth_migration ---
+    auth_migration = {}
+    try:
+        auth_migration = run_auth_agent(
+            upload_dir=str(upload_dir),
+            output_dir=str(migrated_dir),
+        )
+    except Exception:
+        auth_migration = {"status": "skipped", "summary": "Auth agent could not run during report generation."}
+
+    # --- readiness scorecard ---
+    patterns_found = len([c for c in changes if 'System.Web' in c.get('summary','')])
+    high_fixes = len([f for f in manual_fixes if any(k in f for k in ['System.Web','Global.asax','packages.config','HttpContext.Current'])])
+    medium_fixes = len(manual_fixes) - high_fixes
+    build_passed = validation.get('success', False)
+
+    def _score(val): return max(0, min(100, val))
+
+    readiness_categories = [
+        {
+            'name': 'Build Status',
+            'score': _score(95 if build_passed else 40),
+            'status': 'Good' if build_passed else 'Risk',
+            'description': 'dotnet build passed' if build_passed else 'Build failed or skipped — review errors'
+        },
+        {
+            'name': 'Legacy Code Removed',
+            'score': _score(100 - high_fixes * 15),
+            'status': 'Good' if high_fixes == 0 else 'Risk',
+            'description': f'{high_fixes} high-priority legacy pattern(s) still present' if high_fixes else 'No critical legacy patterns remaining'
+        },
+        {
+            'name': 'Code Quality',
+            'score': _score(100 - medium_fixes * 10),
+            'status': 'Good' if medium_fixes == 0 else 'Review',
+            'description': f'{medium_fixes} code quality item(s) to review' if medium_fixes else 'No code quality issues detected'
+        },
+        {
+            'name': 'Dependencies',
+            'score': _score(90 if dependency_map else 60),
+            'status': 'Good' if dependency_map else 'Review',
+            'description': f'{len(dependency_map)} package(s) migrated to .NET 8' if dependency_map else 'No packages detected in migrated .csproj'
+        },
+        {
+            'name': 'Files Migrated',
+            'score': _score(100 if len(changes) > 0 else 0),
+            'status': 'Good' if len(changes) > 0 else 'Risk',
+            'description': f'{len(changes)} file(s) successfully migrated'
+        },
+    ]
+    readiness_score = round(sum(c['score'] for c in readiness_categories) / len(readiness_categories))
+    readiness_level = 'Ready' if readiness_score >= 80 else 'Moderate' if readiness_score >= 60 else 'High Risk'
+    readiness_recs = []
+    if not build_passed:
+        readiness_recs.append('Fix build errors before deploying — check Build Error AI Fixer for details.')
+    if high_fixes > 0:
+        readiness_recs.append(f'Address {high_fixes} high-priority item(s) in Manual Fix List before deploying.')
+    if medium_fixes > 0:
+        readiness_recs.append(f'Review {medium_fixes} code quality item(s) in Manual Fix List.')
+    if not readiness_recs:
+        readiness_recs.append('Migration looks clean — proceed with smoke testing and regression tests.')
+
+    readiness = {
+        'score': readiness_score,
+        'level': readiness_level,
+        'summary': f'{readiness_level} — {readiness_score}/100 migration readiness score.',
+        'categories': readiness_categories,
+        'recommendations': readiness_recs,
+    }
+
     summary = f"{len(migrated_files)} file(s) migrated successfully to .NET 8."
     recommendations = [
         "Migration completed. Review code for business logic correctness.",
@@ -112,10 +215,12 @@ def generate_report():
         "title": ".NET Migration Executive Report",
         "total_files_migrated": len(migrated_files),
         "build_status": "Passed" if validation.get("success") else "Needs Review",
+        "readiness_score": readiness_score,
+        "readiness_level": readiness_level,
         "dependency_count": len(dependency_map),
         "manual_fix_count": len(manual_fixes),
         "diff_summary": diff["summary"],
-        "recommendations": recommendations,
+        "recommendations": readiness_recs,
     }
 
     return {
@@ -125,6 +230,8 @@ def generate_report():
         "recommendations": recommendations,
         "dependency_map": dependency_map,
         "manual_fixes": manual_fixes,
+        "readiness": readiness,
+        "auth_migration": auth_migration,
         "validation": validation,
         "diff": diff,
         "code_rewrite_previews": code_rewrite_previews,

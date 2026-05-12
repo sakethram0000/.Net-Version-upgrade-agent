@@ -29,7 +29,14 @@ function App() {
       .catch(() => setOllamaStatus({ connected: false, status: 'unreachable' }));
   }, []);
 
-  const scopes = useMemo(() => ['Project files', 'Source code', 'Packages', 'Config', 'Build fix', 'Tests'], []);
+  const scopes = useMemo(() => [
+    { label: 'Projects',   key: 'project_count',      value: () => inventory?.project_count || 0 },
+    { label: 'CS Files',   key: 'source_file_count',  value: () => inventory?.source_file_count || 0 },
+    { label: 'Packages',   key: 'packages',           value: () => inventory?.packages?.length || 0 },
+    { label: 'Findings',   key: 'patterns',           value: () => inventory?.patterns?.length || 0 },
+    { label: 'Complexity', key: 'complexity',         value: () => inventory?.complexity?.level || '—' },
+    { label: 'Frameworks', key: 'frameworks',         value: () => inventory?.frameworks?.join(', ') || '—' },
+  ], [inventory]);
   const stageIndex = getStageIndex(job);
 
   async function uploadSelected(event) {
@@ -197,7 +204,7 @@ function App() {
           </div>
           <div className="ma-hero-pills">
             <span className="hero-pill"><span className="pill-dot blue"></span>Microsoft Agent Framework</span>
-            <span className="hero-pill"><span className="pill-dot purple"></span>OpenAI / Azure OpenAI</span>
+            <span className="hero-pill"><span className="pill-dot purple"></span>Groq LLM</span>
             <span className="hero-pill"><span className="pill-dot green"></span>.NET 8/9/10</span>
             <span className="hero-pill"><span className="pill-dot orange"></span>Build Validation</span>
             <OllamaStatus status={ollamaStatus} />
@@ -257,7 +264,7 @@ function App() {
           <article className="ma-card">
             <div className="ma-card-header"><div className="ma-card-title">Migration Controls</div></div>
             <div className="ma-card-body">
-              <div className="scope-grid">{scopes.map((scope) => <div className="scope-card on" key={scope}><div className="si">{scope.slice(0, 2)}</div><div className="sl">{scope}</div></div>)}</div>
+              <div className="scope-grid">{scopes.map((s) => <div className="scope-card on" key={s.key}><div className="si">{String(s.value()).slice(0, 4)}</div><div className="sl">{s.label}</div></div>)}</div>
               <button className="run-btn" disabled={!files.length || busy === 'migration'} onClick={startMigration}>{busy === 'migration' ? 'Migration running...' : 'Run Migration'}</button>
               <button className="secondary-run" disabled={!files.length} onClick={runAnalyze}>Refresh Analysis</button>
               {runtime && <div className="runtime-box">{runtime.agent_framework.detail}<br />LLM: {runtime.llm.provider} / {runtime.llm.model}</div>}
@@ -283,7 +290,7 @@ function App() {
 
         <section className="two-col">
           <Findings inventory={inventory} report={report} />
-          <Actions runtime={runtime} />
+          <Actions job={job} />
         </section>
 
         <section className="ma-card">
@@ -300,6 +307,7 @@ function App() {
             <Output title="Test Generation Agent" ready={!!report?.generated_tests} onClick={() => setSelectedOutput(outputContent('Test Generation Agent', report.generated_tests))} />
             <Output title="Executive Report" ready={!!report?.executive_report} onClick={() => setSelectedOutput(outputContent('Executive Report', report.executive_report))} />
             <Output title="Manual Fix List" ready={!!report} onClick={() => setSelectedOutput(outputContent('Manual Fix List', report?.manual_fixes || []))} />
+            <Output title="Auth Migration Report" ready={!!report?.auth_migration?.status} onClick={() => setSelectedOutput(outputContent('Auth Migration Report', report.auth_migration))} />
             <Output title="Change Log" ready={!!report} onClick={() => setSelectedOutput(outputContent('Change Log', report?.changes || []))} />
             <Output title="Migrated Project Zip" ready={job?.status === 'completed'} onClick={() => window.location.href = `${API_BASE}/api/files/download`} />
           </div>
@@ -390,14 +398,53 @@ function Findings({ inventory, report }) {
   return <article className="ma-card"><div className="ma-card-header"><div className="ma-card-title">Key Findings</div></div><div className="ma-card-body"><div className="findings-summary"><Badge label="Critical" count={critical.length} cls="critical" /><Badge label="Warnings" count={warnings.length} cls="warning" /><Badge label="Manual Fixes" count={report?.manual_fixes?.length || 0} cls="info" /></div><div className="findings-list">{[...critical, ...warnings].map((item, i) => <div className={`f-item ${item.severity === 'High' ? 'critical' : 'warning'}`} key={`${item.title}-${i}`}>{item.title}: {item.action}</div>)}</div></div></article>;
 }
 
-function Actions({ runtime }) {
-  const actions = runtime?.planned_agents || [
-    { name: 'Ingestion Agent', role: 'Create isolated workspace' },
-    { name: 'Inventory Agent', role: 'Scan projects and packages' },
-    { name: 'Migration Planner Agent', role: 'Create target-version plan' },
-    { name: 'Build Validator Agent', role: 'Run dotnet restore/build/test' },
+function Actions({ job }) {
+  const agents = [
+    { name: 'Ingestion Agent',      role: 'Extract upload and create isolated workspace', stages: ['queued'] },
+    { name: 'Analyzer Agent',       role: 'Scan projects, packages and detect patterns',  stages: ['migrating'] },
+    { name: 'LLM Migration Agent',  role: 'Rewrite source files to target .NET version',  stages: ['migrating'] },
+    { name: 'Auth Agent',           role: 'Detect, migrate and verify authentication',     stages: ['migrating'] },
+    { name: 'Fix Agent',            role: 'Apply deterministic structural fixes',          stages: ['migrating'] },
+    { name: 'Build Validator',      role: 'Pre-clean legacy files, build and auto-fix',   stages: ['validate', 'completed', 'needs-review'] },
   ];
-  return <article className="ma-card"><div className="ma-card-header"><div className="ma-card-title">Autonomous Actions</div></div><div className="ma-card-body action-list">{actions.map((a) => <div className="a-item" key={a.name}><span className="a-icon">AF</span><span className="a-text"><strong>{a.name}</strong><br />{a.role}</span></div>)}</div></article>;
+
+  const stage = job?.stage || '';
+  const completed = job?.status === 'completed' || job?.status === 'needs_review';
+
+  function getState(agent) {
+    if (!job) return 'waiting';
+    if (completed) return 'done';
+    if (agent.stages.includes(stage)) return 'active';
+    const order = ['queued', 'migrating', 'validate', 'completed'];
+    const agentIdx = Math.max(...agent.stages.map(s => order.indexOf(s)));
+    const currentIdx = order.indexOf(stage);
+    if (currentIdx > agentIdx) return 'done';
+    return 'waiting';
+  }
+
+  const stateStyle = {
+    done:    { bg: '#22c55e', color: '#fff', icon: '✓' },
+    active:  { bg: '#3b82f6', color: '#fff', icon: '●' },
+    waiting: { bg: '#e2e8f0', color: '#94a3b8', icon: '○' },
+  };
+
+  return (
+    <article className="ma-card">
+      <div className="ma-card-header"><div className="ma-card-title">Autonomous Agents</div></div>
+      <div className="ma-card-body action-list">
+        {agents.map((a) => {
+          const s = getState(a);
+          const st = stateStyle[s];
+          return (
+            <div className="a-item" key={a.name}>
+              <span className="a-icon" style={{ background: st.bg, color: st.color, borderRadius: '50%', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, flexShrink: 0 }}>{st.icon}</span>
+              <span className="a-text"><strong style={{ color: s === 'active' ? '#3b82f6' : s === 'done' ? '#22c55e' : undefined }}>{a.name}</strong><br />{a.role}</span>
+            </div>
+          );
+        })}
+      </div>
+    </article>
+  );
 }
 
 function Badge({ label, count, cls }) {
@@ -428,6 +475,7 @@ function OutputDetail({ output, jobId }) {
       {output.type === 'rewrite' && <RewritePreviewDetail items={output.data} />}
       {output.type === 'agentReport' && <AgentReportDetail report={output.data} />}
       {output.type === 'list' && <ListDetail items={output.data} />}
+      {output.type === 'auth' && <AuthMigrationDetail auth={output.data} />}
       <pre className="detail-json">{JSON.stringify(output.data, null, 2)}</pre>
     </section>
   );
@@ -530,6 +578,7 @@ function outputContent(title, data) {
     'Executive Report': 'agentReport',
     'Manual Fix List': 'list',
     'Change Log': 'list',
+    'Auth Migration Report': 'auth',
   };
   const reportKindByTitle = {
     'Migration Summary': 'executive',
@@ -661,6 +710,45 @@ function DependencyMapDetail({ depmap }) {
           <span>{version}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function AuthMigrationDetail({ auth }) {
+  if (!auth) return <div className="detail-list"><div>No auth migration data available.</div></div>;
+  const statusColor = auth.status === 'passed' ? '#22c55e' : auth.status === 'needs_review' ? '#f59e0b' : '#ef4444';
+  return (
+    <div style={{ padding: '8px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+        <span style={{ fontWeight: 700, color: statusColor, fontSize: 15 }}>{auth.summary}</span>
+      </div>
+      <div style={{ marginBottom: 8 }}><strong>Auth Type Detected:</strong> {auth.auth_type || 'none'}</div>
+      {auth.roles?.length > 0 && <div style={{ marginBottom: 8 }}><strong>Roles:</strong> {auth.roles.join(', ')}</div>}
+      {auth.protected_files?.length > 0 && <div style={{ marginBottom: 8 }}><strong>Protected Controllers:</strong> {auth.protected_files.length}</div>}
+      {auth.checks?.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <strong>Verification Checks:</strong>
+          {auth.checks.map((c, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, fontSize: 13 }}>
+              <span style={{ color: c.passed ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{c.passed ? '✓' : '✗'}</span>
+              <span>{c.name}</span>
+              {!c.passed && <span style={{ color: '#94a3b8', fontSize: 12 }}>— {c.description}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {auth.warnings?.length > 0 && auth.auth_type !== 'none' && (
+        <div style={{ background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: 6, padding: '8px 12px' }}>
+          <strong style={{ color: '#92400e' }}>Action Required:</strong>
+          {auth.warnings.map((w, i) => <div key={i} style={{ fontSize: 13, color: '#78350f', marginTop: 4 }}>⚠ {w}</div>)}
+        </div>
+      )}
+      {auth.changes?.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <strong>Changes Applied:</strong>
+          {auth.changes.map((c, i) => <div key={i} style={{ fontSize: 13, color: '#475569', marginTop: 2 }}>• {c}</div>)}
+        </div>
+      )}
     </div>
   );
 }

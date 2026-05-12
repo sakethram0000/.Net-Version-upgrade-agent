@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from agents.analyzer import analyze
 from agents.migrator import migrate
 from agents.fixer import run_fixes
+from agents.auth_agent import run_auth_agent
+from agents.build_validator import run_build_validator
 from agents.validator import validate
 from agents.reporter import generate_report
 import uuid
@@ -62,7 +64,19 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
             migration_jobs[job_id]["progress"] = "Migration failed."
             return
 
-        # Step 2 — Fix Agent (deterministic fixes, no LLM)
+        # Step 2 — Auth Agent (deterministic, no LLM)
+        update_progress("Auth Agent: Detecting and migrating authentication...")
+        auth_result = {}
+        try:
+            auth_result = run_auth_agent(
+                upload_dir=upload_dir,
+                output_dir=OUTPUT_DIR,
+                progress_callback=update_progress
+            )
+        except Exception as ae:
+            update_progress(f"Auth Agent warning: {str(ae)}")
+
+        # Step 3 — Fix Agent (deterministic fixes, no LLM)
         update_progress("Fix Agent: Applying structural fixes...")
         manual_fixes = []
         try:
@@ -78,7 +92,18 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
             fix_count = 0
             update_progress(f"Fix Agent warning: {str(fe)}")
 
-        # Step 3 — Copy config files from uploads to output (appsettings, launchSettings)
+        # Step 4 — Build Validator (pre-clean + build loop + auto-fix)
+        update_progress("Build Validator: Starting pre-build cleanup and validation...")
+        build_result = {}
+        try:
+            build_result = run_build_validator(
+                output_dir=OUTPUT_DIR,
+                progress_callback=update_progress
+            )
+        except Exception as bve:
+            update_progress(f"Build Validator warning: {str(bve)}")
+
+        # Step 5 — Copy config files from uploads to output
         try:
             upload_path = Path(upload_dir)
             output_path = Path(OUTPUT_DIR)
@@ -111,7 +136,14 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
         result["migrated"] = {k: v for k, v in result.get("migrated", {}).items() if v != "[merged into Program.cs]"}
         migration_jobs[job_id]["result"] = result
         migration_jobs[job_id]["result"]["manual_fixes"] = manual_fixes
-        migration_jobs[job_id]["progress"] = f"Migration completed. {result['count']} files migrated. {fix_count} fixes applied."
+        migration_jobs[job_id]["result"]["auth"] = auth_result
+        migration_jobs[job_id]["result"]["build_validation"] = build_result
+        build_passed = build_result.get("success", False)
+        migration_jobs[job_id]["progress"] = (
+            f"Migration completed. {result['count']} files migrated. "
+            f"{fix_count} fixes applied. "
+            f"Build {'passed' if build_passed else 'needs review'}."
+        )
 
     except Exception as e:
         migration_jobs[job_id]["status"] = "failed"
