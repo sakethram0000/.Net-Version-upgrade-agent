@@ -58,6 +58,71 @@ def _detect_patterns(upload_path: Path) -> list:
     return found[:30]
 
 
+def _detect_ui_profile(upload_path: Path) -> dict:
+    all_files = [f for f in upload_path.rglob("*") if f.is_file()
+                 and not any(p.lower() in SKIP_FOLDERS for p in f.parts)]
+
+    cshtml_files  = [f for f in all_files if f.suffix.lower() == ".cshtml"]
+    aspx_files    = [f for f in all_files if f.suffix.lower() in {".aspx", ".ascx", ".master"}]
+    razor_files   = [f for f in all_files if f.suffix.lower() == ".razor"]
+    has_angular   = any(f.name == "angular.json" for f in all_files)
+    has_react     = any(f.name == "package.json" for f in all_files)
+    has_bundling  = any(f.name.lower() == "bundleconfig.cs" for f in all_files)
+
+    # Count HTML helpers in cshtml files
+    html_helper_count = 0
+    for f in cshtml_files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            html_helper_count += len(re.findall(r'@Html\.', text))
+            if any(s in text for s in ["@Scripts.Render", "@Styles.Render"]):
+                has_bundling = True
+        except Exception:
+            pass
+
+    # Determine primary UI type
+    if aspx_files:
+        ui_type = "webforms"
+        warning = (f"Web Forms UI detected ({len(aspx_files)} page(s)) — "
+                   f"will be automatically converted to .NET 8 Razor Pages.")
+        support = "not_supported"
+    elif cshtml_files:
+        ui_type = "razor_mvc"
+        warning = (f"Razor MVC UI detected ({len(cshtml_files)} view(s)) — "
+                   f"will be automatically migrated to .NET 8.")
+        support = "partial"
+    elif razor_files:
+        ui_type = "blazor"
+        warning = (f"Blazor UI detected ({len(razor_files)} component(s)) — "
+                   f"will be automatically migrated to .NET 8.")
+        support = "partial"
+    elif has_angular:
+        ui_type = "angular"
+        warning = "Angular frontend detected — backend will be migrated to .NET 8, frontend stays as-is."
+        support = "backend_only"
+    elif has_react:
+        ui_type = "react"
+        warning = "React frontend detected — backend will be migrated to .NET 8, frontend stays as-is."
+        support = "backend_only"
+    else:
+        ui_type = "none"
+        warning = ""
+        support = "full"
+
+    return {
+        "ui_type":           ui_type,
+        "support":           support,
+        "warning":           warning,
+        "cshtml_count":      len(cshtml_files),
+        "aspx_count":        len(aspx_files),
+        "razor_count":       len(razor_files),
+        "html_helper_count": html_helper_count,
+        "has_bundling":      has_bundling,
+        "has_angular":       has_angular,
+        "has_react":         has_react,
+    }
+
+
 def _inspect_csproj(path: Path, root: Path) -> dict:
     content = path.read_text(encoding="utf-8", errors="ignore")
     packages, target_framework = [], ""
@@ -89,6 +154,7 @@ def analyze(upload_dir: str, from_version: str, to_version: str) -> dict:
             "complexity": {"score": 0, "level": "Low"},
             "recommended_path": "Upload a project zip or source files to begin analysis.",
             "from_version": from_version, "to_version": to_version,
+            "ui_profile": {"ui_type": "none", "support": "full", "warning": ""},
         }
 
     csproj_files = [upload_path / p for p in files if p.endswith(".csproj")]
@@ -97,7 +163,9 @@ def analyze(upload_dir: str, from_version: str, to_version: str) -> dict:
 
     projects  = [_inspect_csproj(f, upload_path) for f in csproj_files if f.exists()]
     packages  = sorted({pkg["name"] for proj in projects for pkg in proj["packages"]})
-    frameworks = sorted({proj["target_framework"] for proj in projects if proj["target_framework"]})
+    frameworks = sorted({proj["target_framework"] for proj in projects if proj["target_framework"] and proj["is_web"]})
+    if not frameworks:
+        frameworks = sorted({proj["target_framework"] for proj in projects if proj["target_framework"]})
     patterns  = _detect_patterns(upload_path)
 
     # Complexity score
@@ -143,4 +211,5 @@ def analyze(upload_dir: str, from_version: str, to_version: str) -> dict:
         "complexity": {"score": points, "level": level},
         "recommended_path": recommended,
         "analysis": analysis_text,
+        "ui_profile": _detect_ui_profile(upload_path),
     }

@@ -68,20 +68,65 @@ Rules:
 # Folders to always skip during file reading
 SKIP_FOLDERS = {"obj", "bin", ".vs", ".git", "node_modules", ".idea", "packages"}
 
+# Extensions that get LLM migration
+CODE_EXTENSIONS = {".cs", ".csproj", ".sln", ".config"}
+
+# Extensions to copy as-is (no LLM, no modification)
+COPY_EXTENSIONS = {
+    ".cshtml", ".razor", ".json", ".xml", ".yaml", ".yml",
+    ".html", ".htm", ".css", ".js", ".ts", ".jsx", ".tsx",
+    ".txt", ".md", ".ico", ".png", ".jpg", ".jpeg", ".gif",
+    ".svg", ".woff", ".woff2", ".ttf", ".eot", ".map",
+    ".aspx", ".ascx", ".master", ".resx", ".edmx",
+}
+
+# Folders to always skip
+SKIP_COPY_FOLDERS = {"obj", "bin", ".vs", ".git", "node_modules", ".idea", "packages"}
+
 def read_files_recursive(upload_dir: str) -> dict:
+    """Read only code files that need LLM migration."""
     files = {}
     upload_path = Path(upload_dir)
-    for ext in ["*.cs", "*.csproj", "*.sln", "*.config"]:
-        for file in upload_path.rglob(ext):
-            # Skip obj/bin/hidden folders
-            if any(part.lower() in SKIP_FOLDERS for part in file.parts):
-                continue
-            try:
-                relative_path = file.relative_to(upload_path)
-                files[str(relative_path)] = file.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                pass
+    for file in upload_path.rglob("*"):
+        if not file.is_file():
+            continue
+        if any(part.lower() in SKIP_FOLDERS for part in file.parts):
+            continue
+        if file.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        try:
+            relative_path = file.relative_to(upload_path)
+            files[str(relative_path)] = file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
     return files
+
+
+def copy_non_code_files(upload_dir: str, output_dir: Path) -> int:
+    """
+    Copy all non-code files (views, static assets, config json etc.)
+    from upload to output as-is. These are not touched by LLM.
+    Returns count of files copied.
+    """
+    upload_path = Path(upload_dir)
+    copied = 0
+    for file in upload_path.rglob("*"):
+        if not file.is_file():
+            continue
+        if any(part.lower() in SKIP_COPY_FOLDERS for part in file.parts):
+            continue
+        if file.suffix.lower() not in COPY_EXTENSIONS:
+            continue
+        try:
+            rel = file.relative_to(upload_path)
+            dst = output_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(str(file), str(dst))
+            copied += 1
+        except Exception:
+            pass
+    return copied
 
 def extract_code(response: str, lang: str = "csharp") -> str:
     match = re.search(rf'```(?:{lang}|cs|xml|text)?\s*(.*?)\s*```', response, re.DOTALL)
@@ -143,6 +188,13 @@ def migrate(upload_dir: str, from_version: str, to_version: str, progress_callba
     output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Copy all non-code files first (views, static assets, wwwroot, json configs)
+    if progress_callback:
+        progress_callback("Copying views, static assets and config files...")
+    copied = copy_non_code_files(upload_dir, output_dir)
+    if progress_callback:
+        progress_callback(f"Copied {copied} non-code file(s) to output.")
+
     migrated = {}
     total_files = len(files)
     model_names = get_model_names(files)
@@ -180,23 +232,51 @@ Rules:
 
         response = ask_with_system(SYSTEM_PROGRAM, prompt)
         merged_code = extract_code(response, "csharp")
-        # Reviewer pass on Program.cs — most critical file
         if progress_callback:
             progress_callback("Reviewing merged Program.cs...")
         merged_code = review_code(merged_code, program_path)
         time.sleep(1)
 
-        # Save merged Program.cs
         out_path = output_dir / program_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(merged_code, encoding="utf-8")
         migrated[program_path] = merged_code
-
-        # Skip Startup.cs — do not write it to output
         migrated[startup_path] = "[merged into Program.cs]"
 
         if progress_callback:
             progress_callback(f"Merged Program.cs + Startup.cs (1/{total_files})")
+
+    elif program_path and not startup_path:
+        # Program.cs only — migrate it directly with SYSTEM_PROGRAM
+        if progress_callback:
+            progress_callback("Migrating Program.cs to .NET 8 minimal hosting...")
+
+        program_content = files[program_path]
+        prompt = f"""Migrate this Program.cs from {from_version} to .NET 8 minimal hosting.
+
+{program_content[:4000]}
+
+Rules:
+- Use WebApplication.CreateBuilder(args)
+- Keep ALL services and middleware intact
+- Keep Swagger, JWT, CORS, Razor Pages, MVC — whatever is already there
+- End with app.Run()
+- Return ONLY the complete Program.cs inside a ```csharp block."""
+
+        response = ask_with_system(SYSTEM_PROGRAM, prompt)
+        program_code = extract_code(response, "csharp")
+        if progress_callback:
+            progress_callback("Reviewing Program.cs...")
+        program_code = review_code(program_code, program_path)
+        time.sleep(1)
+
+        out_path = output_dir / program_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(program_code, encoding="utf-8")
+        migrated[program_path] = program_code
+
+        if progress_callback:
+            progress_callback(f"Migrated Program.cs (1/{total_files})")
 
     for index, (relative_path, content) in enumerate(files.items(), start=1):
         # Skip Program.cs and Startup.cs — already handled
@@ -259,17 +339,11 @@ Return ONLY the migrated XML in a ```xml block."""
             code = extract_code(response, "xml")
 
         elif file_type == '.sln':
-            migrated[relative_path] = content
-            out_path = output_dir / relative_path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(content, encoding="utf-8")
+            # .sln already copied by copy_non_code_files — skip
             continue
 
         else:
-            migrated[relative_path] = content
-            out_path = output_dir / relative_path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(content, encoding="utf-8")
+            # all other files already copied — skip
             continue
 
         out_path = output_dir / relative_path

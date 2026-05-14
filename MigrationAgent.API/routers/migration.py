@@ -4,6 +4,9 @@ from agents.analyzer import analyze
 from agents.migrator import migrate
 from agents.fixer import run_fixes
 from agents.auth_agent import run_auth_agent
+from agents.view_migrator import run_view_migrator
+from agents.webforms_migrator import run_webforms_migrator
+from agents.blazor_migrator import run_blazor_migrator
 from agents.build_validator import run_build_validator
 from agents.validator import validate
 from agents.reporter import generate_report
@@ -15,6 +18,7 @@ import time
 import urllib.request
 import urllib.error
 from typing import Dict, Any
+import os
 import shutil
 from pathlib import Path
 
@@ -76,7 +80,46 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
         except Exception as ae:
             update_progress(f"Auth Agent warning: {str(ae)}")
 
-        # Step 3 — Fix Agent (deterministic fixes, no LLM)
+        # Step 3 — View Migration Agent (only runs if .cshtml files exist)
+        update_progress("View Migration Agent: Checking for Razor views...")
+        view_result = {}
+        try:
+            view_result = run_view_migrator(
+                output_dir=OUTPUT_DIR,
+                from_version=from_version,
+                to_version=to_version,
+                progress_callback=update_progress
+            )
+        except Exception as ve:
+            update_progress(f"View Migration Agent warning: {str(ve)}")
+
+        # Step 4 — Web Forms Migration Agent (only runs if .aspx files exist)
+        update_progress("Web Forms Agent: Checking for Web Forms files...")
+        webforms_result = {}
+        try:
+            webforms_result = run_webforms_migrator(
+                output_dir=OUTPUT_DIR,
+                from_version=from_version,
+                to_version=to_version,
+                progress_callback=update_progress
+            )
+        except Exception as we:
+            update_progress(f"Web Forms Agent warning: {str(we)}")
+
+        # Step 5 — Blazor Migration Agent (only runs if .razor files exist)
+        update_progress("Blazor Agent: Checking for Blazor components...")
+        blazor_result = {}
+        try:
+            blazor_result = run_blazor_migrator(
+                output_dir=OUTPUT_DIR,
+                from_version=from_version,
+                to_version=to_version,
+                progress_callback=update_progress
+            )
+        except Exception as be:
+            update_progress(f"Blazor Agent warning: {str(be)}")
+
+        # Step 6 — Fix Agent (deterministic fixes, no LLM)
         update_progress("Fix Agent: Applying structural fixes...")
         manual_fixes = []
         try:
@@ -92,7 +135,7 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
             fix_count = 0
             update_progress(f"Fix Agent warning: {str(fe)}")
 
-        # Step 4 — Build Validator (pre-clean + build loop + auto-fix)
+        # Step 6 — Build Validator (pre-clean + build loop + auto-fix)
         update_progress("Build Validator: Starting pre-build cleanup and validation...")
         build_result = {}
         try:
@@ -103,33 +146,7 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
         except Exception as bve:
             update_progress(f"Build Validator warning: {str(bve)}")
 
-        # Step 5 — Copy config files from uploads to output
-        try:
-            upload_path = Path(upload_dir)
-            output_path = Path(OUTPUT_DIR)
-            config_files = ["appsettings.json", "appsettings.Development.json"]
-            for config_file in config_files:
-                for src in upload_path.rglob(config_file):
-                    # Find matching project folder in output
-                    try:
-                        rel = src.relative_to(upload_path)
-                        dst = output_path / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(src), str(dst))
-                    except Exception:
-                        pass
-            # Copy launchSettings.json
-            for src in upload_path.rglob("launchSettings.json"):
-                try:
-                    rel = src.relative_to(upload_path)
-                    dst = output_path / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(src), str(dst))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        # Step 7 — done
         migration_jobs[job_id]["status"] = "completed"
         migration_jobs[job_id]["stage"] = "completed"
         # Filter out the [merged into Program.cs] placeholder from migrated dict
@@ -137,6 +154,9 @@ def run_migration_job(job_id: str, upload_dir: str, from_version: str, to_versio
         migration_jobs[job_id]["result"] = result
         migration_jobs[job_id]["result"]["manual_fixes"] = manual_fixes
         migration_jobs[job_id]["result"]["auth"] = auth_result
+        migration_jobs[job_id]["result"]["view_migration"] = view_result
+        migration_jobs[job_id]["result"]["webforms_migration"] = webforms_result
+        migration_jobs[job_id]["result"]["blazor_migration"] = blazor_result
         migration_jobs[job_id]["result"]["build_validation"] = build_result
         build_passed = build_result.get("success", False)
         migration_jobs[job_id]["progress"] = (
@@ -318,16 +338,25 @@ def start_runtime(job_id: str):
         }
 
     port = _free_port()
-    url = f'http://127.0.0.1:{port}'
+    url = f'http://0.0.0.0:{port}'
+
+    # Clean stale obj/bin before running
+    for folder in ['obj', 'bin']:
+        stale = csproj.parent / folder
+        if stale.exists():
+            shutil.rmtree(stale, ignore_errors=True)
+
     process = subprocess.Popen(
         ['dotnet', 'run', '--project', str(csproj), '--urls', url, '--no-launch-profile'],
         cwd=str(csproj.parent),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
+        env={**os.environ, 'ASPNETCORE_ENVIRONMENT': 'Development'},
     )
+    display_url = f'http://127.0.0.1:{port}'
     runtime_apps[job_id] = {
-        'status': 'starting', 'url': url, 'port': port,
-        'process': process, 'logs': [f'Starting {csproj.name} on {url}'],
+        'status': 'starting', 'url': display_url, 'port': port,
+        'process': process, 'logs': [f'Starting {csproj.name} on {display_url}'],
     }
     threading.Thread(target=_capture_logs, args=(job_id, process), daemon=True).start()
     for _ in range(30):
@@ -361,31 +390,57 @@ def stop_runtime(job_id: str):
     return _runtime_status(job_id)
 
 def _detect_routes(output_dir: str) -> list:
-    """Scan migrated controllers and extract real API routes."""
+    """Scan migrated controllers and Razor Pages to extract real routes."""
     routes = []
     out = Path(output_dir)
+
+    # Scan controllers
     for cs_file in out.rglob('*Controller.cs'):
         if any(p.lower() in {'obj', 'bin'} for p in cs_file.parts):
             continue
         try:
             content = cs_file.read_text(encoding='utf-8', errors='ignore')
             ctrl_name = cs_file.stem.replace('Controller', '').lower()
-            # Only pick up routes that start with api/ or match [Route("api/...")]
             for match in re.findall(r'\[Route\(["\']([^"\']+)["\']\)\]', content):
                 route = match.replace('[controller]', ctrl_name)
                 if not route.startswith('/'):
                     route = '/' + route
-                # Only include routes that look like real API paths
                 if 'api' in route.lower() and route not in routes:
                     routes.append(route)
         except Exception:
             pass
+
+    # Scan Razor Pages — add page routes
+    razor_pages = [
+        f for f in out.rglob('*.cshtml')
+        if not any(p.lower() in {'obj', 'bin'} for p in f.parts)
+        and not f.name.startswith('_')
+    ]
+    if razor_pages:
+        # Always add root for Razor Pages projects
+        if '/' not in routes:
+            routes.insert(0, '/')
+        for page in razor_pages[:4]:
+            # Convert Pages/Info.cshtml -> /Info
+            try:
+                parts = list(page.parts)
+                pages_idx = next((i for i, p in enumerate(parts) if p.lower() == 'pages'), None)
+                if pages_idx is not None:
+                    rel_parts = parts[pages_idx + 1:]
+                    route = '/' + '/'.join(p.replace('.cshtml', '') for p in rel_parts)
+                    if route not in routes and 'shared' not in route.lower():
+                        routes.append(route)
+            except Exception:
+                pass
+
     # Always add /health as optional
     if '/health' not in routes:
         routes.append('/health')
-    # Fallback
-    if len(routes) <= 1:
+
+    # Fallback for pure API projects
+    if not routes or routes == ['/health']:
         routes = ['/api', '/health']
+
     return routes[:6]
 
 

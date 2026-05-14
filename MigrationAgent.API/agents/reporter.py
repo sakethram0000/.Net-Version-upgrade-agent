@@ -22,6 +22,9 @@ def generate_report():
         "manual_fixes": [],
         "readiness": {"score": 0, "level": "Unknown", "summary": "", "categories": [], "recommendations": []},
         "auth_migration": {},
+        "view_migration": {},
+        "webforms_migration": {},
+        "blazor_migration": {},
         "validation": {"success": False, "stage": "not run", "output": "", "errors": ""},
         "diff": {"summary": {"added": 0, "modified": 0, "removed": 0, "unchanged": 0}, "added": [], "modified": [], "removed": [], "previews": []},
         "code_rewrite_previews": [],
@@ -134,6 +137,42 @@ def generate_report():
     # --- generated_tests ---
     generated_tests = _generated_tests(migrated_dir)
 
+    # --- view_migration ---
+    view_migration = {}
+    try:
+        from agents.view_migrator import run_view_migrator
+        view_migration = run_view_migrator(
+            output_dir=str(migrated_dir),
+            from_version="",
+            to_version="",
+        )
+    except Exception:
+        view_migration = {"skipped": True, "reason": "View migration report unavailable."}
+
+    # --- blazor_migration ---
+    blazor_migration = {}
+    try:
+        from agents.blazor_migrator import run_blazor_migrator
+        blazor_migration = run_blazor_migrator(
+            output_dir=str(migrated_dir),
+            from_version="",
+            to_version="",
+        )
+    except Exception:
+        blazor_migration = {"skipped": True, "reason": "Blazor migration report unavailable."}
+
+    # --- webforms_migration ---
+    webforms_migration = {}
+    try:
+        from agents.webforms_migrator import run_webforms_migrator
+        webforms_migration = run_webforms_migrator(
+            output_dir=str(migrated_dir),
+            from_version="",
+            to_version="",
+        )
+    except Exception:
+        webforms_migration = {"skipped": True, "reason": "Web Forms migration report unavailable."}
+
     # --- auth_migration ---
     auth_migration = {}
     try:
@@ -231,6 +270,9 @@ def generate_report():
         "dependency_map": dependency_map,
         "manual_fixes": manual_fixes,
         "readiness": readiness,
+        "view_migration": view_migration,
+        "webforms_migration": webforms_migration,
+        "blazor_migration": blazor_migration,
         "auth_migration": auth_migration,
         "validation": validation,
         "diff": diff,

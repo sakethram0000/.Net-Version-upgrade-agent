@@ -286,7 +286,7 @@ function App() {
           </div>
         </section>
 
-        <ReadinessScorecard readiness={report?.readiness} inventory={inventory} />
+        <ReadinessScorecard readiness={report?.readiness} inventory={inventory} report={report} />
 
         <section className="two-col">
           <Findings inventory={inventory} report={report} />
@@ -308,6 +308,7 @@ function App() {
             <Output title="Executive Report" ready={!!report?.executive_report} onClick={() => setSelectedOutput(outputContent('Executive Report', report.executive_report))} />
             <Output title="Manual Fix List" ready={!!report} onClick={() => setSelectedOutput(outputContent('Manual Fix List', report?.manual_fixes || []))} />
             <Output title="Auth Migration Report" ready={!!report?.auth_migration?.status} onClick={() => setSelectedOutput(outputContent('Auth Migration Report', report.auth_migration))} />
+            <Output title="UI Migration Report" ready={!!report} onClick={() => setSelectedOutput(outputContent('UI Migration Report', { view: report?.view_migration, webforms: report?.webforms_migration, blazor: report?.blazor_migration }))} />
             <Output title="Change Log" ready={!!report} onClick={() => setSelectedOutput(outputContent('Change Log', report?.changes || []))} />
             <Output title="Migrated Project Zip" ready={job?.status === 'completed'} onClick={() => window.location.href = `${API_BASE}/api/files/download`} />
           </div>
@@ -348,7 +349,7 @@ function Metric({ label, value }) {
   return <div className="compat-metric"><span className="cm-label">{label}</span><div className="cm-bar"><div className="cm-fill effort" style={{ width: `${Math.min(100, Number(value) || 0)}%` }}></div></div><span className="cm-val">{value}</span></div>;
 }
 
-function ReadinessScorecard({ readiness, inventory }) {
+function ReadinessScorecard({ readiness, inventory, report }) {
   const fallback = inventory ? {
     score: Math.max(0, 100 - Number(inventory?.complexity?.score || 0)),
     level: 'Pre-migration estimate',
@@ -386,9 +387,62 @@ function ReadinessScorecard({ readiness, inventory }) {
             </article>
           ))}
         </div>
+        <UiProfileRow profile={inventory?.ui_profile} report={report} />
         <div className="readiness-recs">{(data.recommendations || []).map((item) => <div key={item}>{item}</div>)}</div>
       </div>
     </section>
+  );
+}
+
+function UiProfileRow({ profile, report }) {
+  const uiType = profile?.ui_type || 'none';
+  const view = report?.view_migration;
+  const webforms = report?.webforms_migration;
+  const blazor = report?.blazor_migration;
+  const migrated = report && (view || webforms || blazor);
+
+  const uiLabels = {
+    razor_mvc:    'Razor MVC',
+    webforms:     'Web Forms',
+    blazor:       'Blazor',
+    angular:      'Angular',
+    react:        'React',
+    none:         null,
+  };
+
+  const label = uiLabels[uiType];
+
+  return (
+    <div style={{ margin: '12px 0 4px', padding: '10px 14px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+      <div style={{ fontWeight: 700, fontSize: 13, color: '#1e293b', marginBottom: 6 }}>UI Profile</div>
+      {!label ? (
+        <div style={{ fontSize: 13, color: '#64748b' }}>No UI detected — backend-only project.</div>
+      ) : (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-start' }}>
+          <div style={{ fontSize: 13 }}>
+            <span style={{ fontWeight: 600, color: '#334155' }}>Type: </span>
+            <span style={{ color: '#3b82f6', fontWeight: 700 }}>{label}</span>
+          </div>
+          {!migrated ? (
+            <div style={{ fontSize: 13, color: '#64748b' }}>
+              {uiType === 'razor_mvc' && `${profile.cshtml_count} view(s) detected — will be automatically migrated to .NET 8.`}
+              {uiType === 'webforms' && `${profile.aspx_count} page(s) detected — will be automatically converted to Razor Pages.`}
+              {uiType === 'blazor' && `${profile.razor_count} component(s) detected — will be migrated to .NET 8.`}
+              {(uiType === 'angular' || uiType === 'react') && 'Frontend detected — backend will be migrated, frontend stays as-is.'}
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, color: '#64748b' }}>
+              {uiType === 'razor_mvc' && view && !view.skipped && `${view.views_processed} view(s) migrated — ${view.helpers_replaced} helper(s) replaced${view.manual_review?.length ? `, ${view.manual_review.length} need review` : ', no manual review needed'}.`}
+              {uiType === 'webforms' && webforms && !webforms.skipped && `${webforms.pages_processed} page(s) converted — ${webforms.controls_replaced} control(s) replaced${webforms.manual_review?.length ? `, ${webforms.manual_review.length} need review` : ', no manual review needed'}.`}
+              {uiType === 'blazor' && blazor && !blazor.skipped && `${blazor.components_processed} component(s) migrated — ${blazor.fixes_applied} fix(es) applied${blazor.manual_review?.length ? `, ${blazor.manual_review.length} need review` : ', no manual review needed'}.`}
+              {(uiType === 'angular' || uiType === 'react') && 'Frontend unchanged — backend migrated successfully.'}
+              {uiType === 'razor_mvc' && view?.skipped && 'No Razor views found in migrated output.'}
+              {uiType === 'webforms' && webforms?.skipped && 'No Web Forms files found in migrated output.'}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -403,6 +457,9 @@ function Actions({ job }) {
     { name: 'Ingestion Agent',      role: 'Extract upload and create isolated workspace', stages: ['queued'] },
     { name: 'Analyzer Agent',       role: 'Scan projects, packages and detect patterns',  stages: ['migrating'] },
     { name: 'LLM Migration Agent',  role: 'Rewrite source files to target .NET version',  stages: ['migrating'] },
+    { name: 'View Migration Agent',  role: 'Migrate Razor views — HTML Helpers to Tag Helpers', stages: ['migrating'] },
+    { name: 'Web Forms Agent',        role: 'Convert .aspx/.ascx/.master to .NET 8 Razor Pages', stages: ['migrating'] },
+    { name: 'Blazor Agent',            role: 'Migrate .razor components to .NET 8',               stages: ['migrating'] },
     { name: 'Auth Agent',           role: 'Detect, migrate and verify authentication',     stages: ['migrating'] },
     { name: 'Fix Agent',            role: 'Apply deterministic structural fixes',          stages: ['migrating'] },
     { name: 'Build Validator',      role: 'Pre-clean legacy files, build and auto-fix',   stages: ['validate', 'completed', 'needs-review'] },
@@ -476,6 +533,7 @@ function OutputDetail({ output, jobId }) {
       {output.type === 'agentReport' && <AgentReportDetail report={output.data} />}
       {output.type === 'list' && <ListDetail items={output.data} />}
       {output.type === 'auth' && <AuthMigrationDetail auth={output.data} />}
+      {output.type === 'uimigration' && <UiMigrationDetail data={output.data} />}
       <pre className="detail-json">{JSON.stringify(output.data, null, 2)}</pre>
     </section>
   );
@@ -579,6 +637,7 @@ function outputContent(title, data) {
     'Manual Fix List': 'list',
     'Change Log': 'list',
     'Auth Migration Report': 'auth',
+    'UI Migration Report': 'uimigration',
   };
   const reportKindByTitle = {
     'Migration Summary': 'executive',
@@ -749,6 +808,96 @@ function AuthMigrationDetail({ auth }) {
           {auth.changes.map((c, i) => <div key={i} style={{ fontSize: 13, color: '#475569', marginTop: 2 }}>• {c}</div>)}
         </div>
       )}
+    </div>
+  );
+}
+
+function UiMigrationDetail({ data }) {
+  const view = data?.view;
+  const webforms = data?.webforms;
+  const blazor = data?.blazor;
+  const hasView = view && !view.skipped;
+  const hasWebForms = webforms && !webforms.skipped;
+  const hasBlazor = blazor && !blazor.skipped;
+
+  if (!hasView && !hasWebForms && !hasBlazor) {
+    return <div className="detail-list"><div style={{ color: '#64748b', fontSize: 13 }}>No UI files were found in this project — backend-only migration was performed.</div></div>;
+  }
+
+  function Section({ title, items, color }) {
+    if (!items?.length) return null;
+    return (
+      <div style={{ marginBottom: 12, padding: '8px 12px', background: color === 'green' ? '#f0fdf4' : '#fffbeb', borderRadius: 6, borderLeft: `3px solid ${color === 'green' ? '#22c55e' : '#f59e0b'}` }}>
+        <strong style={{ fontSize: 13, color: color === 'green' ? '#166534' : '#92400e' }}>{title}</strong>
+        {items.map((f, i) => <div key={i} style={{ fontSize: 13, color: color === 'green' ? '#166534' : '#78350f', marginTop: 2 }}>{color === 'green' ? '✓' : '⚠'} {f}</div>)}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: '8px 0' }}>
+      {hasView && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10, color: '#1e293b' }}>Razor MVC Views</div>
+          <div className="detail-grid" style={{ marginBottom: 12 }}>
+            <article><span>Views Processed</span><strong>{view.views_processed ?? 0}</strong></article>
+            <article><span>Helpers Replaced</span><strong>{view.helpers_replaced ?? 0}</strong></article>
+            <article><span>LLM Passes</span><strong>{view.llm_passes ?? 0}</strong></article>
+            <article><span>Manual Review</span><strong style={{ color: view.manual_review?.length ? '#f59e0b' : '#22c55e' }}>{view.manual_review?.length || 'None'}</strong></article>
+          </div>
+          <Section title="_ViewImports.cshtml" items={view.viewimports_fixed} color="green" />
+          <Section title="Changes Applied" items={view.changes} color="green" />
+          <Section title="Needs Manual Review" items={view.manual_review} color="yellow" />
+        </div>
+      )}
+      {hasWebForms && (
+        <div style={{ marginBottom: hasBlazor ? 20 : 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10, color: '#1e293b' }}>Web Forms Pages</div>
+          <div className="detail-grid" style={{ marginBottom: 12 }}>
+            <article><span>Pages Processed</span><strong>{webforms.pages_processed ?? 0}</strong></article>
+            <article><span>Controls Replaced</span><strong>{webforms.controls_replaced ?? 0}</strong></article>
+            <article><span>LLM Passes</span><strong>{webforms.llm_passes ?? 0}</strong></article>
+            <article><span>Manual Review</span><strong style={{ color: webforms.manual_review?.length ? '#f59e0b' : '#22c55e' }}>{webforms.manual_review?.length || 'None'}</strong></article>
+          </div>
+          <Section title="Structural Fixes" items={webforms.structural_fixes} color="green" />
+          <Section title="Changes Applied" items={webforms.changes} color="green" />
+          <Section title="Needs Manual Review" items={webforms.manual_review} color="yellow" />
+        </div>
+      )}
+      {hasBlazor && (
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10, color: '#1e293b' }}>Blazor Components</div>
+          <div className="detail-grid" style={{ marginBottom: 12 }}>
+            <article><span>Components</span><strong>{blazor.components_processed ?? 0}</strong></article>
+            <article><span>Fixes Applied</span><strong>{blazor.fixes_applied ?? 0}</strong></article>
+            <article><span>LLM Passes</span><strong>{blazor.llm_passes ?? 0}</strong></article>
+            <article><span>Manual Review</span><strong style={{ color: blazor.manual_review?.length ? '#f59e0b' : '#22c55e' }}>{blazor.manual_review?.length || 'None'}</strong></article>
+          </div>
+          <Section title="Structural Fixes" items={blazor.structural_fixes} color="green" />
+          <Section title="Changes Applied" items={blazor.changes} color="green" />
+          <Section title="Needs Manual Review" items={blazor.manual_review} color="yellow" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UiWarningBanner({ profile }) {
+  if (!profile || !profile.warning) return null;
+  const colors = {
+    not_supported: { border: '#ef4444', bg: '#fef2f2', icon: '✕', text: '#991b1b' },
+    partial:       { border: '#f59e0b', bg: '#fffbeb', icon: '⚠', text: '#92400e' },
+    backend_only:  { border: '#3b82f6', bg: '#eff6ff', icon: 'ℹ', text: '#1e40af' },
+  };
+  const c = colors[profile.support] || colors.partial;
+  return (
+    <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, borderLeft: `4px solid ${c.border}`, background: c.bg, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+      <span style={{ fontWeight: 700, color: c.border, fontSize: 16, flexShrink: 0 }}>{c.icon}</span>
+      <div>
+        <div style={{ fontWeight: 700, color: c.text, fontSize: 13 }}>UI Detected: {profile.ui_type.replace('_', ' ').toUpperCase()}</div>
+        <div style={{ fontSize: 12, color: c.text, marginTop: 2 }}>{profile.warning}</div>
+        {profile.has_bundling && <div style={{ fontSize: 12, color: c.text, marginTop: 2 }}>Script bundling detected — will be converted to standard script references.</div>}
+      </div>
     </div>
   );
 }
